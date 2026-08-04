@@ -7,7 +7,7 @@ use crate::{
     scroll::{ScrollOffset, SharedScrollAnchor},
 };
 use gpui::{Pixels, WindowTextSystem};
-use language::{CharClassifier, Point};
+use language::{CharClassifier, CharKind, Point};
 use multi_buffer::{MultiBufferOffset, MultiBufferRow, MultiBufferSnapshot};
 use serde::Deserialize;
 use workspace::searchable::Direction;
@@ -263,79 +263,71 @@ pub fn line_end(
 
 /// Returns a position of the previous word boundary, where a word character is defined as either
 /// uppercase letter, lowercase letter, '_' character or language-specific word character (like '-' in CSS).
+///
+/// Mirrors VS Code's `cursorWordLeft`: the cursor lands at the start of the previous run of word
+/// or punctuation characters, except that a single punctuation character directly trailing a word
+/// is skipped together with that word (`hello.|` moves to `|hello.`, while `hello...|` stops at
+/// `hello|...` and `foo .|` stops at `foo |.`). The motion never crosses more than one line at a
+/// time: from a line start it moves onto the previous line and stops at a line start otherwise.
 pub fn previous_word_start(map: &DisplaySnapshot, point: DisplayPoint) -> DisplayPoint {
     let raw_point = point.to_point(map);
     let buffer_snapshot = map.buffer_snapshot();
     let classifier = buffer_snapshot.char_classifier_at(raw_point);
     let cursor_offset = raw_point.to_offset(buffer_snapshot);
-    let cursor_char = buffer_snapshot.chars_at(cursor_offset).next();
 
-    let mut is_first_iteration = true;
-    let word_start = find_preceding_boundary_display_point(
-        map,
-        point,
-        FindRange::MultiLine,
-        &mut |left, right| {
-            // Make alt-left skip punctuation to respect VSCode behaviour. For example: hello.| goes to |hello.
-            if is_first_iteration
-                && classifier.is_punctuation(right)
-                && !classifier.is_punctuation(left)
-                && left != '\n'
-                && (!classifier.is_whitespace(left)
-                    || cursor_char.is_some_and(|character| {
-                        !classifier.is_whitespace(character) && character != '\n'
-                    }))
-            {
-                is_first_iteration = false;
-                return false;
-            }
-            is_first_iteration = false;
+    let mut offset = cursor_offset;
+    let mut chars = buffer_snapshot.reversed_chars_at(cursor_offset).peekable();
 
-            (classifier.kind(left) != classifier.kind(right) && !classifier.is_whitespace(right))
-                || left == '\n'
-        },
-    );
-
-    let word_start_point = word_start.to_point(map);
-    let word_start_offset = word_start_point.to_offset(buffer_snapshot);
-    let mut chars_before_word = buffer_snapshot.reversed_chars_at(word_start_offset);
-    let Some(punctuation) = chars_before_word
-        .next()
-        .filter(|character| classifier.is_punctuation(*character))
-    else {
-        return word_start;
-    };
-
-    let char_before_punctuation = chars_before_word.next();
-    let punctuation_is_single =
-        char_before_punctuation.is_none_or(|character| !classifier.is_punctuation(character));
-    let punctuation_prefixes_word = buffer_snapshot
-        .chars_at(word_start_offset)
-        .next()
-        .is_some_and(|character| classifier.is_word(character));
-    let cursor_is_at_word_end = buffer_snapshot
-        .reversed_chars_at(cursor_offset)
-        .next()
-        .is_some_and(|character| classifier.is_word(character))
-        && cursor_char.is_none_or(|character| !classifier.is_word(character));
-
-    // Forward movement treats a single punctuation prefix as part of the following word.
-    // Include it when moving back from the word's end so `|@word` and `@word|` are symmetric.
-    // Only do this when the punctuation is a true prefix (not preceded by a word char),
-    // otherwise `a-b-c|` would jump to `a-b|-c` instead of `a-b-|c`.
-    let punctuation_is_prefix =
-        char_before_punctuation.is_none_or(|character| !classifier.is_word(character));
-    if cursor_is_at_word_end
-        && punctuation_is_single
-        && punctuation_prefixes_word
-        && punctuation_is_prefix
-    {
-        let mut punctuation_offset = word_start_offset;
-        punctuation_offset -= punctuation.len_utf8();
-        punctuation_offset.to_display_point(map)
-    } else {
-        word_start
+    if chars.peek() == Some(&'\n') {
+        chars.next();
+        offset -= '\n'.len_utf8();
     }
+    while let Some(&ch) = chars.peek() {
+        if ch == '\n' || !classifier.is_whitespace(ch) {
+            break;
+        }
+        chars.next();
+        offset -= ch.len_utf8();
+    }
+
+    let run_end = offset;
+    if let Some(&run_char) = chars.peek().filter(|&&ch| ch != '\n') {
+        let run_kind = classifier.kind(run_char);
+        while let Some(&ch) = chars.peek() {
+            if ch == '\n' || classifier.kind(ch) != run_kind {
+                break;
+            }
+            chars.next();
+            offset -= ch.len_utf8();
+        }
+
+        if run_kind == CharKind::Punctuation {
+            let run_extends_past_cursor = run_end == cursor_offset
+                && buffer_snapshot
+                    .chars_at(cursor_offset)
+                    .next()
+                    .is_some_and(|ch| classifier.is_punctuation(ch));
+            let punctuation_is_single =
+                run_end - offset == run_char.len_utf8() && !run_extends_past_cursor;
+            let punctuation_trails_word = chars
+                .peek()
+                .is_some_and(|&ch| ch != '\n' && classifier.is_word(ch));
+            if punctuation_is_single && punctuation_trails_word {
+                while let Some(&ch) = chars.peek() {
+                    if ch == '\n' || !classifier.is_word(ch) {
+                        break;
+                    }
+                    chars.next();
+                    offset -= ch.len_utf8();
+                }
+            }
+        }
+    }
+
+    map.clip_point(
+        offset.to_point(buffer_snapshot).to_display_point(map),
+        Bias::Left,
+    )
 }
 
 /// Returns a position of the previous word boundary, where a word character is defined as either
@@ -491,25 +483,69 @@ pub fn is_subword_start(left: char, right: char, classifier: &CharClassifier) ->
 
 /// Returns a position of the next word boundary, where a word character is defined as either
 /// uppercase letter, lowercase letter, '_' character or language-specific word character (like '-' in CSS).
+///
+/// Mirrors VS Code's `cursorWordRight`: the cursor lands at the end of the next run of word or
+/// punctuation characters, except that a single punctuation character directly preceding a word
+/// is skipped together with that word (`|.hello` moves to `.hello|`, while `|...hello` stops at
+/// `...|hello` and `|. foo` stops at `.| foo`). The motion never crosses more than one line at a
+/// time: from a line end it moves onto the next line and stops at a line end otherwise.
 pub fn next_word_end(map: &DisplaySnapshot, point: DisplayPoint) -> DisplayPoint {
     let raw_point = point.to_point(map);
-    let classifier = map.buffer_snapshot().char_classifier_at(raw_point);
-    let mut is_first_iteration = true;
-    find_boundary(map, point, FindRange::MultiLine, &mut |left, right| {
-        // Make alt-right skip punctuation to respect VSCode behaviour. For example: |.hello goes to .hello|
-        if is_first_iteration
-            && classifier.is_punctuation(left)
-            && classifier.is_word(right)
-            && right != '\n'
-        {
-            is_first_iteration = false;
-            return false;
-        }
-        is_first_iteration = false;
+    let buffer_snapshot = map.buffer_snapshot();
+    let classifier = buffer_snapshot.char_classifier_at(raw_point);
+    let cursor_offset = raw_point.to_offset(buffer_snapshot);
 
-        (classifier.kind(left) != classifier.kind(right) && !classifier.is_whitespace(left))
-            || right == '\n'
-    })
+    let mut offset = cursor_offset;
+    let mut chars = buffer_snapshot.chars_at(cursor_offset).peekable();
+
+    if chars.peek() == Some(&'\n') {
+        chars.next();
+        offset += '\n'.len_utf8();
+    }
+    while let Some(&ch) = chars.peek() {
+        if ch == '\n' || !classifier.is_whitespace(ch) {
+            break;
+        }
+        chars.next();
+        offset += ch.len_utf8();
+    }
+
+    let run_start = offset;
+    if let Some(&run_char) = chars.peek().filter(|&&ch| ch != '\n') {
+        let run_kind = classifier.kind(run_char);
+        while let Some(&ch) = chars.peek() {
+            if ch == '\n' || classifier.kind(ch) != run_kind {
+                break;
+            }
+            chars.next();
+            offset += ch.len_utf8();
+        }
+
+        if run_kind == CharKind::Punctuation {
+            let run_extends_before_cursor = run_start == cursor_offset
+                && buffer_snapshot
+                    .reversed_chars_at(cursor_offset)
+                    .next()
+                    .is_some_and(|ch| classifier.is_punctuation(ch));
+            let punctuation_is_single =
+                offset - run_start == run_char.len_utf8() && !run_extends_before_cursor;
+            let punctuation_prefixes_word = chars
+                .peek()
+                .is_some_and(|&ch| ch != '\n' && classifier.is_word(ch));
+            if punctuation_is_single && punctuation_prefixes_word {
+                while let Some(&ch) = chars.peek() {
+                    if ch == '\n' || !classifier.is_word(ch) {
+                        break;
+                    }
+                    chars.next();
+                    offset += ch.len_utf8();
+                }
+            }
+        }
+    }
+
+    let point = offset.to_point(buffer_snapshot);
+    map.clip_point(map.point_to_display_point(point, Bias::Right), Bias::Right)
 }
 
 /// Returns a position of the next word boundary, where a word character is defined as either
@@ -1120,27 +1156,45 @@ mod tests {
         assert("ˇlorem_ˇipsum", cx);
         assert(" ˇdefγˇ", cx);
         assert(" ˇbcΔˇ", cx);
-        // Test punctuation skipping behavior
+        // A single punctuation character trailing a word is skipped together with that word.
         assert("ˇhello.ˇ", cx);
+        assert("ˇhello.ˇ world", cx);
+        assert("ˇlorem-ˇ", cx);
+        assert("ˇhello. ˇworld", cx);
+        assert("[2001:4860:4860::ˇ8888] ˇ", cx);
+        assert("\"ˇword\"ˇ", cx);
+        assert("\"ˇword\" ˇ", cx);
+        assert("^\"ˇword\"ˇ", cx);
+        // Longer punctuation runs stop at the start of the run.
         assert("helloˇ...ˇ", cx);
         assert("helloˇ.---..ˇtest", cx);
         assert("test  ˇ.--ˇtest", cx);
         assert("oneˇ,;:!?ˇtwo", cx);
+        assert("helloˇ.ˇ..", cx);
+        assert("aˇ.ˇ.b", cx);
+        // Detached punctuation (not trailing a word) stops at the start of the run.
         assert("foo ˇ.ˇ bar", cx);
-        assert("ˇfoo @ˇbar", cx);
-        assert("foo ˇ@barˇ baz", cx);
+        assert("foo ˇ@ˇbar", cx);
+        // Moving from a word's end stops at the word's start, never including any
+        // punctuation before it.
+        assert("foo @ˇbarˇ baz", cx);
         assert("foo @ˇbˇar", cx);
         assert("foo ..ˇbarˇ baz", cx);
-        assert("ˇ.helloˇ", cx);
-        assert("[2001:4860:4860::8888ˇ] ˇ", cx);
+        assert("foo .ˇbarˇ", cx);
+        assert(".ˇhelloˇ", cx);
+        assert("@ˇwordˇ", cx);
+        assert("func NewConenctor() *ˇConnectorˇ", cx);
+        assert("func NewConenctor() *ˇConnectˇor", cx);
         // Punctuation between words is a separator, not a prefix.
         // opt-left should stop to the right of the punctuation, not the left.
         assert("a-b-ˇcˇ", cx);
         assert("a.b.ˇcˇ", cx);
         assert("foo.ˇbarˇ", cx);
         assert("a@ˇbˇ", cx);
-        // Punctuation at start of buffer (or after whitespace) is a true prefix.
-        assert("ˇ@wordˇ", cx);
+        // Crossing a newline still applies the punctuation rules to the previous line.
+        assert("ˇhello.\nˇworld", cx);
+        assert("helloˇ...\nˇworld", cx);
+        assert("foo, ˇbar}\nˇ\n", cx);
     }
 
     #[gpui::test]
@@ -1317,17 +1371,30 @@ mod tests {
         assert("loremˇ_ipsumˇ", cx);
         assert(" ˇbcΔˇ", cx);
         assert(" abˇ——ˇcd", cx);
-        // Test punctuation skipping behavior
+        // A single punctuation character prefixing a word is skipped together with that word.
         assert("ˇ.helloˇ", cx);
+        assert("ˇ .helloˇ", cx);
         assert("display_pointsˇ[0ˇ]", cx);
+        assert("foo ˇ@barˇ baz", cx);
+        assert("fooˇ .barˇ", cx);
+        assert("func NewConenctor() ˇ*Connectorˇ", cx);
+        // Longer punctuation runs stop at the end of the run.
         assert("ˇ...ˇhello", cx);
         assert("helloˇ.---..ˇtest", cx);
         assert("testˇ.--ˇ test", cx);
         assert("oneˇ,;:!?ˇtwo", cx);
+        assert("hello.ˇ.ˇworld", cx);
+        assert("ˇ..ˇhello", cx);
+        // Detached punctuation (not prefixing a word) stops at the end of the run.
         assert("foo ˇ.ˇ bar", cx);
         assert("fooˇ.ˇ bar", cx);
-        assert("foo ˇ@barˇ baz", cx);
         assert("[2001:4860:4860::8888ˇ]ˇ ", cx);
+        // Moving from before a word stops at the word's end.
+        assert("foo .ˇbarˇ", cx);
+        assert("fooˇ barˇ.", cx);
+        // Crossing a newline still applies the punctuation rules to the next line.
+        assert("helloˇ\n.worldˇ", cx);
+        assert("helloˇ\n...ˇworld", cx);
     }
 
     #[gpui::test]
